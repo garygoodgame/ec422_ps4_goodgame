@@ -245,6 +245,134 @@ forecast::dm.test(e_var4_ffr, e_bvar_ffr, h = 1, power = 2)
 
 # For GDP growth, the DM test rejects equal accuracy of the VAR(4) and the BVAR(4, λ = 0.3) (DM = 2.14, p = 0.035), and the positive statistic indicates the BVAR has the lower squared-error loss. The same holds for the federal funds rate (DM = 2.00, p = 0.048). This supports my result in 4.3b that shrinkage improves on the OLS VAR(4), so the lower RMSEs are not just sampling noise. However, the evidence is not overwhelming: both p-values are close to 0.05
 
+## Part 5
+
+# 5.1a
+
+md_raw <- read_csv("data/fredmd_2026-09.csv", show_col_types = FALSE)
+tcode <- unlist(md_raw[1, -1])
+md <- md_raw[-1, ] |> mutate(date = as.Date(sasdate, "%m/%d/%Y"))
+
+transform_series <- function(x, code) {
+  d <- function(v) c(NA, diff(v))
+  switch(as.character(code),
+         "1" = x,                      # level
+         "2" = d(x),                   # first difference
+         "3" = d(d(x)),                # second difference
+         "4" = log(x),                 # log
+         "5" = 100 * d(log(x)),        # growth rate
+         "6" = 100 * d(d(log(x))),     # change in the growth rate
+         "7" = d(x / dplyr::lag(x) - 1))
+}
+
+# 5.1b
+
+fm <- map2_dfc(md[names(tcode)], tcode, transform_series) |>
+  mutate(date = md$date, .before = 1) |>
+  filter(date >= as.Date("1960-03-01"), date <= as.Date("2019-12-01"))
+
+fm <- fm[, colSums(is.na(fm)) == 0]
+
+dim(fm)
+
+# 5.1c
+
+tcode[c("INDPRO", "PAYEMS", "CPIAUCSL", "FEDFUNDS")]
+
+# INDPRO (code 5): the monthly growth rate, 100 × the first difference of the log, which is approximately the percent change in industrial production.
+# PAYEMS (code 5): the monthly growth rate of payroll employment, the same transformation.
+# CPIAUCSL (code 6): the change in the growth rate, 100 × the second difference of the log. This is the monthly change in inflation, not inflation itself.
+# FEDFUNDS (code 2): the first difference, which is the monthly change in the interest rate in percentage points.
+
+# INDPRO is an index that grows exponentially. It trends upward over time, and the size of the moves grows with the level. Taking logs turns proportional growth into a straight-line trend, and differencing the logs removes the trend and gives a stable growth rate.
+# FEDFUNDS is already a rate, in percent. It has no exponential trend. It wanders up and down, so it is highly persistent, but the persistence is in the level, and a first difference (the change in points) is enough to make it stationary.
+
+## 5.2
+
+# 5.2a
+
+Z <- fm |> select(-date) |> as.matrix()
+
+pc <- prcomp(scale(Z))
+
+summary(pc)$importance[, 1:5]
+
+# 29.5
+
+# 5.2b
+
+F1 <- pc$x[, 1] * sign(cor(pc$x[, 1], fm$INDPRO))
+
+tibble(date = fm$date, F1 = F1) |>
+  ggplot(aes(date, F1)) +
+  geom_line() +
+  labs(title = "First Factor from FRED-MD", x = NULL, y = NULL) +
+  theme_minimal()
+
+# 5.2c
+
+sort(abs(cor(pc$x[, 1], Z))[1, ], decreasing = TRUE)[1:8]
+sort(abs(cor(pc$x[, 2], Z))[1, ], decreasing = TRUE)[1:8]
+
+# Factor 1 is most strongly correlated with payroll employment, manufacturing employment and industrial production, so it captures real economic activity, the business cycle. Factor 2 is most strongly correlated with CPI and PCE price indexes and their components, so it captures common movements in inflation, probably driven by commodity and energy prices
+# Factor 1 falls sharply during recessions.
+
+# 5.3
+
+ip <- fm$INDPRO
+n <- nrow(Z)
+init <- which(fm$date == as.Date("1989-12-01"))
+
+e_ar <- NULL
+e_fa <- NULL
+for (T in init:(n - 1)) {
+  F_T <- prcomp(scale(Z[1:T, ]))$x[, 1:3]         # factors using data through T
+  d <- data.frame(y_next = ip[2:T], y = ip[1:(T - 1)], F_T[1:(T - 1), ])
+  new <- data.frame(y = ip[T], t(F_T[T, ]))
+  e_ar <- c(e_ar, ip[T + 1] - predict(lm(y_next ~ y, d), new))
+  e_fa <- c(e_fa, ip[T + 1] - predict(lm(y_next ~ ., d), new))
+}
+
+c(RMSE_AR = sqrt(mean(e_ar^2)), RMSE_FA = sqrt(mean(e_fa^2)))
+
+# Estimating the factors once on the full sample uses future information: the factor loadings and the factor values at any date are partly determined by data after that date. A real-time forecaster wouldn't have that information, so the factor model's RMSE would be artificially low
+
+# 5.4
+
+direct_race <- function(series, h = 12, r = 3) {
+  lv <- md |>
+    mutate(log_x = log(.data[[series]]),
+           g = 100 * (log_x - lag(log_x))) |>
+    filter(date >= as.Date("1960-03-01"), date <= as.Date("2019-12-01"))
+  yh <- 100 * (lead(lv$log_x, h) - lv$log_x)      # growth over the next h months
+  g  <- lv$g                                      # growth over the latest month
+  
+  e_ar <- NULL
+  e_fa <- NULL
+  for (T in init:(n - h)) {
+    F_T <- prcomp(scale(Z[1:T, ]))$x[, 1:r, drop = FALSE]
+    i <- 1:(T - h)
+    d <- data.frame(yh = yh[i], g = g[i], F_T[i, , drop = FALSE])
+    new <- data.frame(g = g[T], F_T[T, , drop = FALSE])
+    e_ar <- c(e_ar, yh[T] - predict(lm(yh ~ g, d), new))
+    e_fa <- c(e_fa, yh[T] - predict(lm(yh ~ ., d), new))
+  }
+  tibble(series, forecasts = length(e_ar),
+         RMSE_AR = sqrt(mean(e_ar^2)), RMSE_FA = sqrt(mean(e_fa^2)),
+         MAE_AR = mean(abs(e_ar)), MAE_FA = mean(abs(e_fa)),
+         DM_pvalue = forecast::dm.test(e_ar, e_fa, h = h, power = 2,
+                                       varestimator = "bartlett")$p.value)
+}
+
+direct_race("CPIAUCSL")
+
+# Yes. For 12-month-ahead CPI inflation, adding three factors to the AR benchmark lowers the RMSE from 2.11 to 1.89, a reduction of about 10.4% (MAE falls from 1.58 to 1.35). The Diebold–Mariano test, adjusted for the autocorrelation induced by overlapping 12-month forecasts, rejects equal accuracy (p = 0.0004), so the improvement is statistically significant at the 1% level.
+
+
+
+
+
+
 
 
 
